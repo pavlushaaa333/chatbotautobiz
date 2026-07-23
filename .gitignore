@@ -1,0 +1,29 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secret env files
+.env
+.env.*
+!.env.example
+
+# Local generated/cache data
+.gradio/
+.tmp/
+vectorstore/
+
+# Logs/cache
+*.log
+.cache/
+.pytest_cache/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

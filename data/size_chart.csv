@@ -1,0 +1,22 @@
+product_type,gender,size,height_min_cm,height_max_cm,weight_min_kg,weight_max_kg,fit_note
+Áo sơ mi,nam,M,165,172,55,65,Vừa người
+Áo sơ mi,nam,L,170,178,65,75,Vừa người
+Áo sơ mi,nam,XL,175,183,75,85,Rộng vừa
+Áo sơ mi,nữ,S,150,160,40,48,Ôm vừa
+Áo sơ mi,nữ,M,160,168,48,56,Vừa người
+Áo sơ mi,nữ,L,165,173,55,65,Thoải mái
+Áo thun,nam,M,165,172,55,65,Regular fit
+Áo thun,nam,L,170,178,65,75,Regular fit
+Áo thun,nam,XL,175,183,75,85,Regular fit
+Áo thun,nữ,S,150,160,40,48,Regular fit
+Áo thun,nữ,M,158,168,48,58,Regular fit
+Áo thun,nữ,L,165,175,58,68,Regular fit
+Váy,nữ,S,150,160,40,48,Ôm vừa
+Váy,nữ,M,158,168,48,58,Vừa người
+Váy,nữ,L,165,175,58,68,Thoải mái
+Set bộ,nam,M,165,172,55,65,Vừa người
+Set bộ,nam,L,170,178,65,75,Vừa người
+Set bộ,nam,XL,175,183,75,85,Thoải mái
+Set bộ,nữ,S,150,160,40,48,Vừa người
+Set bộ,nữ,M,158,168,48,58,Vừa người
+Set bộ,nữ,L,165,175,58,68,Thoải mái

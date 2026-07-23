@@ -1,0 +1,12 @@
+variant_id,product_id,sku,size,color,stock_qty,status
+V0002-M-613,P0002,ABF-0002-M-613,M,Sọc xanh trắng,34,in_stock
+V0018-M-RED,P0018,ABF-OXFORD-M-RED,M,Đỏ đô,0,out_of_stock
+V0018-M-WHITE,P0018,ABF-OXFORD-M-WHITE,M,Trắng,9,in_stock
+V0018-M-LIGHTBLUE,P0018,ABF-OXFORD-M-LIGHTBLUE,M,Xanh nhạt,13,in_stock
+V0033-L-367,P0033,ABF-0033-L-367,L,Xanh navy,26,in_stock
+V0001-M-WHITE,P0001,ABF-0001-M-WHITE,M,Trắng,28,in_stock
+V0029-M-WHITE,P0029,ABF-0029-M-WHITE,M,Trắng,4,in_stock
+V0034-M-WHITE,P0034,ABF-0034-M-WHITE,M,Trắng,96,in_stock
+V0040-M-GRAY,P0040,ABF-0040-M-GRAY,M,Xám,30,in_stock
+V0101-M-BLACK,P0101,ABF-0101-M-BLACK,M,Đen,130,in_stock
+V0102-M-BE,P0102,ABF-0102-M-BE,M,Be,52,in_stock

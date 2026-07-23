@@ -1,0 +1,18 @@
+product_id,product_name,category_code,category_name,product_type,brand,price_vnd,sale_price_vnd,status,tags,short_description,rating,sold_30d,stock_total
+P0002,Áo thun basic unisex màu mới,Fashion,Thời trang,Áo thun,AutoBiz Fashion,199000,167000,active,dạo phố|gặp khách hàng|đi làm|basic|unisex|áo thun|sọc xanh trắng,Áo thun basic unisex dễ phối khi dạo phố gặp khách hàng hoặc đi làm,4.8,210,34
+P0018,Áo sơ mi Oxford best seller,Fashion,Thời trang,Áo sơ mi,AutoBiz Fashion,299000,279000,active,áo sơ mi|oxford|best seller|đi làm|công sở|basic|unisex|đỏ đô|trắng|xanh nhạt,Áo sơ mi Oxford chất liệu dễ mặc phù hợp đi làm và gặp khách hàng,4.7,188,22
+P0033,Áo sơ mi denim mỏng mùa hè,Fashion,Thời trang,Áo sơ mi,AutoBiz Fashion,319000,319000,active,mùa hè|denim|casual|phối đồ|áo sơ mi|xanh navy,Áo sơ mi denim mỏng thoáng nhẹ phù hợp mùa hè và phối đồ casual,4.6,142,26
+P0001,Áo thun Sunny Classic,Fashion,Thời trang,Áo thun,Sunny,659000,659000,active,nam|áo thun|basic|trắng|thoải mái,Áo thun nam basic màu trắng thoải mái mặc ở nhà hoặc đi chơi,3.8,41,28
+P0029,Áo thun Sunny Plus,Fashion,Thời trang,Áo thun,Sunny,679000,679000,active,nam|áo thun|trắng|basic,Áo thun nam form rộng dễ mặc hằng ngày,4.3,271,4
+P0034,Áo thun Luna House Mini,Fashion,Thời trang,Áo thun,Luna House,119000,89250,active,nam|áo thun|trắng|basic|thoải mái,Áo thun trắng giá tốt mặc thoải mái ở nhà,4.1,59,96
+P0040,Set bộ Cotton Daily,Fashion,Thời trang,Set bộ,AutoBiz Fashion,259000,229000,active,set bộ|thường ngày|thoải mái|unisex,Set bộ cotton mặc thường ngày gọn nhẹ,4.4,96,30
+P0101,Váy Nami Plus,Fashion,Thời trang,Váy,Nami,349000,349000,active,váy|đầm|nữ tính|đi chơi,Váy nữ tính dễ mặc khi đi chơi,4.6,238,130
+P0102,Váy Luna House Daily,Fashion,Thời trang,Váy,Luna House,289000,289000,active,váy|đầm|đẹp|daily,Váy daily nhẹ nhàng dễ phối,5.0,237,52
+P0067,Sữa rửa mặt Tina Lab Plus,Cosmetics,Mỹ phẩm,Sữa rửa mặt,Tina Lab,219000,199000,active,sữa rửa mặt|da dầu|mụn|làm sạch,Sữa rửa mặt cho da dầu mụn,4.1,104,130
+P0088,Serum Gạo New,Cosmetics,Mỹ phẩm,Serum,Gạo,129000,99000,active,serum|da dầu|mụn|dưỡng da,Serum hỗ trợ da dầu và mụn,4.8,239,129
+P0182,Combo ăn trưa Luna House Classic,Food,Đồ ăn,Combo ăn trưa,Luna House,225000,225000,active,healthy|ít calo|trưa|combo ăn trưa,Combo ăn trưa healthy ít calo,3.9,171,139
+P0195,Salad Mây Studio Premium,Food,Đồ ăn,Salad,Mây Studio,65000,48750,active,healthy|ít calo|trưa|salad,Salad nhẹ bụng cho buổi trưa,4.5,101,81
+P0218,Nước ép Bici Basic,Food,Đồ ăn,Nước ép,Bici,135000,135000,active,healthy|ít calo|nước ép,Nước ép ít calo dùng kèm bữa trưa,4.4,22,66
+P0220,Trà sữa Brown Sugar,Food,Đồ ăn,Trà sữa,Bici,59000,59000,active,trà sữa|ngọt|đồ uống,Trà sữa vị ngọt béo,4.6,180,50
+P0295,Khuyên tai An An Basic,Accessories,Phụ kiện,Khuyên tai,An An,309000,309000,active,phụ kiện|quà tặng|cute|nữ,Khuyên tai cute phù hợp làm quà tặng,4.6,222,21
+P0277,Mũ Sunny Basic,Accessories,Phụ kiện,Mũ,Sunny,109000,109000,active,phụ kiện|vintage|quà tặng|nữ,Mũ vintage dễ phối outfit,4.7,171,29
