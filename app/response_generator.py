@@ -29,13 +29,6 @@ def build_model_context(
     }
 
 
-def build_model_context_text(context: dict[str, Any]) -> str:
-    sections = []
-    for key in ["USER_MESSAGE", "PRODUCT_DATA_FROM_DATABASE", "RAG_CONTEXT", "RULES"]:
-        sections.append(f"{key}\n{context.get(key)}")
-    return "\n\n".join(sections)
-
-
 OUT_OF_SCOPE_COLORS = {
     "trắng",
     "đen",

@@ -11,7 +11,6 @@ import app.service as service_module
 from app.order_draft_service import (
     ORDER_STATE_AWAITING_CONFIRMATION,
     ORDER_STATE_PENDING_SHOP_APPROVAL,
-    ORDER_STATE_SUBMISSION_FAILED,
     SubmissionResult,
     blank_order_draft,
     build_n8n_payload,

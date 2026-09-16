@@ -12,7 +12,7 @@ from typing import Any
 
 
 import requests
-from app.normalizer import extract_color, extract_size, normalize_text, strip_accents
+
 from app.config import active_shop_id
 from app.normalizer import extract_color, extract_size, normalize_text, strip_accents
 
@@ -25,16 +25,6 @@ ORDER_STATE_PENDING_SHOP_APPROVAL = "pending_shop_approval"
 ORDER_STATE_SUBMISSION_FAILED = "submission_failed"
 ORDER_STATE_CANCELLED = "cancelled"
 ORDER_STATE_LEGACY_SUBMITTED = "submitted_to_n8n"
-
-ORDER_STATUSES = {
-    ORDER_STATE_COLLECTING,
-    ORDER_STATE_AWAITING_CONFIRMATION,
-    ORDER_STATE_SUBMITTING,
-    ORDER_STATE_PENDING_SHOP_APPROVAL,
-    ORDER_STATE_SUBMISSION_FAILED,
-    ORDER_STATE_LEGACY_SUBMITTED,
-    ORDER_STATE_CANCELLED,
-}
 
 ORDER_PENDING_ACTIONS = {
     "choose_order_product",
@@ -439,16 +429,6 @@ def normalize_payment_method(text: str | None) -> str | None:
     if re.search(r"\b(?:chuyen khoan|bank transfer|transfer|ngan hang)\b", key):
         return "bank_transfer"
     return None
-
-
-def is_confirmation(text: str | None) -> bool:
-    key = text_key(text)
-    return bool(
-        key in {"ok", "oke", "xac nhan", "dung roi"}
-        or re.search(
-            r"\b(?:thong tin dung|gui shop|chot don|dat giup|ok gui di|gui di)\b", key
-        )
-    )
 
 
 def is_order_confirmation_message(text: str | None) -> bool:

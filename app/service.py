@@ -30,7 +30,6 @@ from app.order_draft_service import (
     is_retry,
     is_valid_phone,
     looks_like_browsing_shift,
-    masked_order_draft,
     missing_order_action,
     normalize_payment_method,
     normalize_phone,

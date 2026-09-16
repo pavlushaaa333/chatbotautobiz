@@ -10,5 +10,4 @@ requests==2.32.3
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
 python-telegram-bot
-python-dotenv
 psycopg[binary]>=3.2.0

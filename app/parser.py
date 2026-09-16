@@ -756,7 +756,6 @@ def parse_customer_message(
         "similar_product",
         "alternative_product",
     }
-
     if is_size_recommendation and not product_type and fit_preference is None:
         clarification_questions.append(
             "Bạn đang muốn chọn size cho áo thun, áo sơ mi hay sản phẩm nào ạ?"
@@ -885,45 +884,3 @@ def parse_customer_message(
         "need_clarification": bool(clarification_questions),
         "clarification_questions": clarification_questions,
     }
-
-
-def extract_fit_preference(text: str) -> str | None:
-    normalized = (text or "").lower().strip()
-
-    loose_keywords = [
-        "mặc rộng",
-        "thích rộng",
-        "form rộng",
-        "rộng rãi",
-        "thoải mái",
-        "oversize",
-        "oversized",
-        "không ôm",
-    ]
-    regular_keywords = [
-        "vừa người",
-        "mặc vừa",
-        "form vừa",
-        "regular",
-        "không quá ôm",
-        "không quá rộng",
-    ]
-    slim_keywords = [
-        "mặc ôm",
-        "thích ôm",
-        "form ôm",
-        "ôm người",
-        "slim",
-        "slim fit",
-    ]
-
-    if any(keyword in normalized for keyword in loose_keywords):
-        return "loose"
-
-    if any(keyword in normalized for keyword in regular_keywords):
-        return "regular"
-
-    if any(keyword in normalized for keyword in slim_keywords):
-        return "slim"
-
-    return None

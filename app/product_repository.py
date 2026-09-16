@@ -202,18 +202,6 @@ DEFAULT_SQL_BY_ENV = {
 }
 
 
-CANONICAL_PRODUCT_FIELDS = (
-    "product_id",
-    "product_name",
-    "sku",
-    "variant",
-    "color",
-    "size",
-    "price",
-    "available_qty",
-    "product_status",
-)
-
 OPTIONAL_COMPATIBILITY_FIELDS = (
     "category_code",
     "category_name",

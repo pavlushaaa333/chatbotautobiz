@@ -54,8 +54,6 @@ SUPPORT_FILES = {
     "policies": "simulated_shop_policies.csv",
 }
 
-REQUIRED_FILES = {**PRODUCT_FILES, **SUPPORT_FILES}
-
 SELLABLE_LISTING_STATUSES = {"active", "low_stock"}
 DATABASE_PRICE_FIELDS = (
     "sale_price",
