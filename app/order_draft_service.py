@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import logging
 import os
 import re
@@ -9,11 +8,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections.abc import Mapping, MutableMapping
 from typing import Any
+from uuid import uuid4
 
 
 import requests
 
 from app.config import active_shop_id
+from app.customer_intent import (
+    build_customer_intent,
+    customer_envelope,
+    enabled as customer_ingress_enabled,
+    validate_receipt,
+)
 from app.normalizer import extract_color, extract_size, normalize_text, strip_accents
 
 logger = logging.getLogger(__name__)
@@ -51,7 +57,6 @@ ORDER_DRAFT_RESET_KEYS = {
     "pending_shop_approval",
 }
 
-_DRAFT_COUNTER = itertools.count(1)
 
 _NUMBER_WORDS = {
     "mot": 1,
@@ -121,7 +126,7 @@ def text_key(text: str | None) -> str:
 
 def new_draft_id(now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
-    return f"DRAFT-{now:%Y%m%d}-{next(_DRAFT_COUNTER):04d}"
+    return f"DRAFT-{now:%Y%m%d}-{uuid4().hex}"
 
 
 def _default_shop_id() -> str | None:
@@ -149,6 +154,7 @@ def blank_order_draft(draft_id: str | None = None) -> dict[str, Any]:
                 "product_id": None,
                 "product_name": None,
                 "sku": None,
+                "variant": None,
                 "color": None,
                 "size": None,
                 "quantity": 1,
@@ -239,6 +245,7 @@ def set_item_product(item: dict[str, Any], product: dict[str, Any]) -> None:
             "product_name": product.get("product_name"),
             "unit_price": product.get("effective_price_vnd"),
             "sku": None,
+            "variant": None,
             "color": None,
             "size": None,
             "variant_stock": None,
@@ -256,6 +263,7 @@ def set_item_variant(
     item.update(
         {
             "sku": variant.get("sku"),
+            "variant": variant.get("variant"),
             "color": variant.get("color"),
             "size": canonical_size,
             "variant_stock": int(variant.get("stock") or 0),
@@ -269,6 +277,7 @@ def clear_item_variant(
     item.update(
         {
             "sku": None,
+            "variant": None,
             "color": color,
             "size": size,
             "variant_stock": None,
@@ -642,6 +651,8 @@ def build_n8n_payload(
     channel: str = "telegram",
     created_at: datetime | None = None,
 ) -> dict[str, Any]:
+    if customer_ingress_enabled():
+        return build_customer_intent(draft, conversation_id)
     created_at = created_at or datetime.now(timezone.utc)
     customer = draft.get("customer") or {}
     payload_items = []
@@ -723,10 +734,16 @@ def _webhook_timeout_seconds() -> int:
 
 
 def submit_draft_order_to_n8n(draft_order: Mapping[str, Any]) -> SubmissionResult:
-    payload = build_n8n_payload(
-        dict(draft_order),
-        conversation_id=str(draft_order.get("customer_chat_id") or ""),
-    )
+    try:
+        payload = build_n8n_payload(
+            dict(draft_order),
+            conversation_id=str(draft_order.get("customer_chat_id") or ""),
+        )
+    except (TypeError, ValueError):
+        return SubmissionResult(
+            ok=False, error_type="invalid_customer_intent",
+            error_message="Customer order configuration or bounded fields are invalid.",
+        )
     url = _webhook_url()
     if not url:
         logger.warning("Draft order webhook URL is not configured.")
@@ -737,23 +754,45 @@ def submit_draft_order_to_n8n(draft_order: Mapping[str, Any]) -> SubmissionResul
             payload=payload,
         )
 
+    if customer_ingress_enabled() and not _webhook_secret():
+        return SubmissionResult(
+            ok=False, error_type="missing_webhook_secret",
+            error_message="Customer ingress authentication is not configured.", payload=payload,
+        )
     try:
         headers = {
             "Content-Type": "application/json",
         }
 
         secret = _webhook_secret()
-        if secret:
+        wire_payload = payload
+        if customer_ingress_enabled():
+            try:
+                wire_payload = customer_envelope(payload, secret)
+            except ValueError:
+                return SubmissionResult(
+                    ok=False, error_type="invalid_customer_credential",
+                    error_message="Customer authentication credential is invalid.", payload=payload,
+                )
+        elif secret:
             headers["x-autobiz-secret"] = secret
 
         response = requests.post(
             url,
-            json=payload,
+            json=wire_payload,
             headers=headers,
             timeout=_webhook_timeout_seconds(),
         )
         status_code = response.status_code
         response.raise_for_status()
+        if customer_ingress_enabled():
+            try:
+                validate_receipt(response.json(), payload)
+            except (ValueError, TypeError, KeyError):
+                return SubmissionResult(
+                    ok=False, status_code=status_code, error_type="invalid_core_receipt",
+                    error_message="Core has not confirmed this draft request.", payload=payload,
+                )
         logger.info(
             "Draft order webhook submitted successfully. status_code=%s", status_code
         )
