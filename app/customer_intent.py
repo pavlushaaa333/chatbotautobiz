@@ -55,6 +55,8 @@ def build_customer_intent(
             }
         )
     source_customer = draft.get("customer") or {}
+    if not isinstance(source_customer, Mapping):
+        raise ValueError("customer must be an object")
     customer = {
         key: text(source_customer.get(key) or draft.get(alias), key, maximum)
         for key, alias, maximum in (
@@ -87,7 +89,10 @@ def validate_receipt(value: Any, payload: Mapping[str, Any]) -> None:
     from uuid import UUID
 
     for field in ("draft_order_id", "run_id", "event_id"):
-        UUID(value[field])
+        identifier = value.get(field)
+        if not isinstance(identifier, str):
+            raise ValueError("Core receipt identifier must be a UUID string")
+        UUID(identifier)
     if value.get("draft_status") != "draft":
         raise ValueError("Core receipt is not a draft awaiting review")
 

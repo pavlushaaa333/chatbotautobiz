@@ -142,13 +142,21 @@ class CustomerIntentTests(unittest.TestCase):
 
     def test_wrong_reference_or_malformed_receipt_is_rejected(self):
         payload = build_customer_intent(valid_draft(), "telegram_1001")
-        for value in (receipt("another-order"), {}, {"status": "DRAFT_CREATED"}):
+        malformed = receipt()
+        malformed["run_id"] = True
+        for value in (
+            receipt("another-order"),
+            {},
+            {"status": "DRAFT_CREATED"},
+            malformed,
+        ):
             with self.assertRaises((ValueError, KeyError, TypeError)):
                 validate_receipt(value, payload)
 
     def test_invalid_quantity_and_control_characters_are_rejected(self):
         for change in (
             lambda d: d["items"][0].update(quantity=True),
+            lambda d: d.update(customer=["invalid"]),
             lambda d: d["customer"].update(address="address\nforged"),
         ):
             draft = valid_draft()
