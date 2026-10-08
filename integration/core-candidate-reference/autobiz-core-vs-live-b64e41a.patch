@@ -1,0 +1,1220 @@
+diff --git a/backend/src/autobiz/customer_order_ingress.py b/backend/src/autobiz/customer_order_ingress.py
+new file mode 100644
+--- /dev/null
++++ b/backend/src/autobiz/customer_order_ingress.py
+@@ -0,0 +1,330 @@
++"""Signed customer intake: installation binding, then Phase 9 draft creation only."""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import json
++from collections.abc import Mapping
++from dataclasses import replace
++from datetime import timedelta
++from typing import Any
++from uuid import uuid4
++
++from autobiz.customer_surface import CustomerSurfaceRequest, CustomerSurfaceService
++from autobiz.external_connector import (
++    ConflictingReplay,
++    ConnectorCapability,
++    ConnectorInstallationRepository,
++    ConnectorService,
++    ConnectorType,
++    ExternalEvent,
++    ExternalEventRepository,
++    ExternalEventStatus,
++    ExternalEventType,
++    InstallationStatus,
++    LocalCredentialResolver,
++)
++from autobiz.integration_bridge_security import MAX_BRIDGE_BODY_BYTES
++from autobiz.integration_ingress import IntegrationIngress, IntegrationIngressError
++from autobiz.order_automation import (
++    ConflictingOrderReplay,
++    OrderAutomationError,
++    OrderAutomationService,
++    OrderConversionService,
++    OrderInputError,
++    build_order_runtime,
++)
++from autobiz.policy_confirmation import PolicyConfirmationService
++from autobiz.tenant import (
++    PostgresTenantAuthorization,
++    TenantContextError,
++    TenantContextResolver,
++    TenantGuard,
++    TenantIdentity,
++)
++
++CUSTOMER_ORDER_PATH = "/v1/integration/customer-order-intents"
++CUSTOMER_CONTRACT = "autobiz.customer-order-intent.v1"
++
++
++def customer_request(value: Any) -> CustomerSurfaceRequest:
++    if not isinstance(value, dict) or value.get("contract") != CUSTOMER_CONTRACT:
++        raise ValueError("unsupported customer contract")
++    allowed = {
++        "contract",
++        "surface",
++        "external_account_reference",
++        "provider_event_id",
++        "external_order_reference",
++        "customer_conversation_id",
++        "items",
++        "customer",
++        "note",
++    }
++    if set(value) - allowed or value.get("surface") != "telegram":
++        raise ValueError("unsupported customer fields or surface")
++    request = CustomerSurfaceRequest(
++        surface=value["surface"],
++        external_account_reference=value["external_account_reference"],
++        provider_event_id=value["provider_event_id"],
++        external_order_reference=value["external_order_reference"],
++        customer_conversation_id=value["customer_conversation_id"],
++        payload=value,
++        connector_type=ConnectorType.CUSTOMER_BOT,
++    )
++    # Strict limits, including fulfillment requirements, apply before any persisted event.
++    if not request.payload["items"]:
++        raise ValueError("order items required")
++    for item in value["items"]:
++        if set(item) - {"sku", "variant", "quantity"}:
++            raise ValueError("customer item cannot supply price or stock")
++    for field in ("name", "phone", "address"):
++        if not request.payload["customer"].get(field):
++            raise ValueError("fulfillment fields required")
++    if set(value["customer"]) - {"name", "phone", "address", "reference"}:
++        raise ValueError("unsupported customer fields")
++    bounded_texts = [
++        getattr(request, field)
++        for field in (
++            "surface",
++            "external_account_reference",
++            "provider_event_id",
++            "external_order_reference",
++            "customer_conversation_id",
++        )
++    ]
++    bounded_texts.extend(request.payload["customer"].values())
++    for item in request.payload["items"]:
++        bounded_texts.extend((item["sku"], item["variant"]))
++    if "note" in value:
++        if not isinstance(value["note"], str):
++            raise ValueError("note must be bounded text")
++        bounded_texts.append(request.payload["note"])
++    for field in bounded_texts:
++        if not field.strip() or any(ord(char) < 32 or ord(char) == 127 for char in field):
++            raise ValueError("empty text or control characters prohibited")
++    return request
++
++
++class CustomerOrderIngress(IntegrationIngress):
++    """Shares RFC9421 and durable nonce fences; does not change generic /events."""
++
++    def __init__(
++        self,
++        *args: Any,
++        confirmation_ttl_seconds: int,
++        customer_credentials_factory: Any = None,
++        **kwargs: Any,
++    ) -> None:
++        super().__init__(*args, **kwargs)
++        if type(confirmation_ttl_seconds) is not int or not 60 <= confirmation_ttl_seconds <= 86400:
++            raise ValueError("explicit confirmation TTL must be 60..86400 seconds")
++        self._confirmation_ttl_seconds = confirmation_ttl_seconds
++        self._customer_credentials_factory = customer_credentials_factory
++
++    def _verify_customer_proof(
++        self, connection: Any, installation: Any, value: dict[str, Any], proof: Any, now: Any
++    ) -> None:
++        if not isinstance(proof, dict) or set(proof) != {"created", "signature"}:
++            raise IntegrationIngressError(
++                401, "CUSTOMER_AUTHENTICATION_FAILED", "customer authentication failed"
++            )
++        created = proof.get("created")
++        signature = proof.get("signature")
++        if (
++            type(created) is not int
++            or abs(int(now.timestamp()) - created) > 120
++            or not isinstance(signature, str)
++            or len(signature) != 64
++        ):
++            raise IntegrationIngressError(
++                401, "CUSTOMER_AUTHENTICATION_FAILED", "customer authentication failed"
++            )
++        if self._customer_credentials_factory is None:
++            from autobiz.credential_rotation import DopplerCredentialResolver
++
++            credentials = DopplerCredentialResolver.from_environment(connection)
++        else:
++            credentials = self._customer_credentials_factory(connection)
++        secret = credentials.resolve(installation)
++        if not isinstance(secret, bytes) or len(secret) < 32:
++            raise IntegrationIngressError(
++                401, "CUSTOMER_AUTHENTICATION_FAILED", "customer authentication failed"
++            )
++        raw = json.dumps(
++            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
++        ).encode("utf-8")
++        base = b"autobiz.customer-order-intent.v1\n" + str(created).encode() + b"\n" + raw
++        expected = hmac.new(secret, base, hashlib.sha256).hexdigest()
++        if not hmac.compare_digest(expected, signature):
++            raise IntegrationIngressError(
++                401, "CUSTOMER_AUTHENTICATION_FAILED", "customer authentication failed"
++            )
++
++    def accept_raw_request(
++        self, *, body: bytes, method: str, path: str, headers: Mapping[str, str]
++    ) -> dict[str, str]:
++        if type(body) is not bytes or len(body) > MAX_BRIDGE_BODY_BYTES:
++            raise IntegrationIngressError(413, "INTEGRATION_MESSAGE_TOO_LARGE", "request too large")
++        if method != "POST" or path != CUSTOMER_ORDER_PATH:
++            raise IntegrationIngressError(
++                403, "INTEGRATION_INGRESS_DENIED", "customer ingress denied"
++            )
++        if self._header(headers, "content-type") != "application/json":
++            raise IntegrationIngressError(
++                415, "UNSUPPORTED_MEDIA_TYPE", "application/json required"
++            )
++        verified = self._verify_bridge(body, method, path, headers)
++        try:
++            envelope = json.loads(verified.body.decode("utf-8"))
++            if not isinstance(envelope, dict) or set(envelope) != {"intent", "customer_auth"}:
++                raise ValueError("customer envelope required")
++            raw_intent = envelope["intent"]
++            request = customer_request(raw_intent)
++        except (ValueError, TypeError, KeyError, UnicodeError) as error:
++            raise IntegrationIngressError(
++                422, "INVALID_CUSTOMER_ORDER_INTENT", "bounded customer fields are invalid"
++            ) from error
++        now = self._now()
++        connection = self._connection_factory()
++        try:
++            with connection.transaction():
++                installation = ConnectorInstallationRepository(connection).resolve_external_account(
++                    ConnectorType.CUSTOMER_BOT, request.external_account_reference
++                )
++                if (
++                    installation is None
++                    or installation.status is not InstallationStatus.ACTIVE
++                    or ConnectorCapability.WEBHOOK not in installation.capabilities
++                    or installation.configuration.get("customer_surface") != request.surface
++                    or installation.configuration.get("customer_ingress_principal")
++                    != verified.identity.principal
++                ):
++                    raise IntegrationIngressError(
++                        403, "INTEGRATION_INGRESS_DENIED", "customer installation is not authorized"
++                    )
++                self._verify_customer_proof(
++                    connection, installation, raw_intent, envelope["customer_auth"], now
++                )
++                resolver = TenantContextResolver(
++                    TenantGuard(PostgresTenantAuthorization(connection))
++                )
++                connectors = ConnectorService(
++                    connection,
++                    credentials=LocalCredentialResolver({}),
++                    tenant_resolver=resolver,
++                    clock=lambda: now,
++                )
++                confirmation = PolicyConfirmationService(connection, clock=lambda: now)
++                conversion = OrderConversionService(
++                    connection, confirmation=confirmation, clock=lambda: now
++                )
++                orders = OrderAutomationService(
++                    connection,
++                    connectors=connectors,
++                    runtime=build_order_runtime(
++                        connection,
++                        confirmation=confirmation,
++                        conversion=conversion,
++                        clock=lambda: now,
++                    ),
++                    clock=lambda: now,
++                )
++                service = CustomerSurfaceService(connectors, orders, resolver)
++                payload = request.payload
++                digest = hashlib.sha256(
++                    json.dumps(
++                        payload,
++                        ensure_ascii=False,
++                        sort_keys=True,
++                        separators=(",", ":"),
++                        allow_nan=False,
++                    ).encode("utf-8")
++                ).hexdigest()
++                event = ExternalEvent(
++                    event_id=uuid4(),
++                    shop_id=installation.shop_id,
++                    installation_id=installation.installation_id,
++                    connector_type=ConnectorType.CUSTOMER_BOT,
++                    provider_event_id=request.provider_event_id,
++                    event_type=ExternalEventType.ORDER_CREATED,
++                    external_object_type="order",
++                    external_object_id=request.external_order_reference,
++                    occurred_at=now,
++                    payload_digest=digest,
++                    payload=payload,
++                    correlation_id=f"customer:{request.provider_event_id}"[:255],
++                    status=ExternalEventStatus.ACCEPTED,
++                    created_at=now,
++                )
++                context = resolver.resolve(
++                    TenantIdentity(
++                        installation.actor_user_id,
++                        f"customer:{request.surface}:{request.customer_conversation_id}",
++                    ),
++                    installation.shop_id,
++                    event.correlation_id,
++                )
++                # Serialize aliases of one logical transport request without a new state table.
++                lock = hashlib.sha256(
++                    f"customer-intent:{installation.installation_id}:{request.external_order_reference}".encode()
++                ).digest()
++                connection.execute(
++                    "SELECT pg_advisory_xact_lock(%s, %s)",
++                    (
++                        int.from_bytes(lock[:4], "big", signed=True),
++                        int.from_bytes(lock[4:8], "big", signed=True),
++                    ),
++                )
++                origin = connection.execute(
++                    "SELECT event_id, payload_digest FROM core_connector_events "
++                    "WHERE shop_id=%s AND installation_id=%s AND external_object_type='order' "
++                    "AND external_object_id=%s ORDER BY created_at, event_id LIMIT 1",
++                    (
++                        context.shop_id,
++                        installation.installation_id,
++                        request.external_order_reference,
++                    ),
++                ).fetchone()
++                if origin is not None and origin[1] != digest:
++                    raise ConflictingReplay("logical customer request conflicts")
++                events = ExternalEventRepository(connection)
++                accepted = events.accept(event)
++                canonical = accepted.event if origin is None else events.get(context, origin[0])
++                if canonical is None:
++                    raise RuntimeError("canonical customer event is unavailable")
++                started = service.start_verified_order(
++                    replace(
++                        request,
++                        occurred_at=canonical.occurred_at,
++                        provider_event_id=canonical.provider_event_id,
++                    ),
++                    canonical,
++                    confirmation_expires_at=canonical.occurred_at + timedelta(
++                        seconds=self._confirmation_ttl_seconds
++                    ),
++                    now=now,
++                )
++                return {
++                    "status": "DRAFT_CREATED",
++                    "draft_status": started.draft.status,
++                    "draft_order_id": str(started.draft.draft_order_id),
++                    "external_order_reference": request.external_order_reference,
++                    "run_id": str(started.run_id),
++                    "event_id": str(started.event_id),
++                }
++        except (ConflictingReplay, ConflictingOrderReplay) as error:
++            raise IntegrationIngressError(
++                409, "INTEGRATION_EVENT_CONFLICT", "customer request conflicts with stored draft"
++            ) from error
++        except TenantContextError as error:
++            raise IntegrationIngressError(
++                403, "INTEGRATION_INGRESS_DENIED", "customer installation is not authorized"
++            ) from error
++        except (OrderInputError, OrderAutomationError, ValueError) as error:
++            raise IntegrationIngressError(
++                422, "INVALID_CUSTOMER_ORDER_INTENT", "customer order cannot be drafted"
++            ) from error
++        finally:
++            connection.close()
+diff --git a/backend/src/autobiz/customer_order_runtime.py b/backend/src/autobiz/customer_order_runtime.py
+new file mode 100644
+--- /dev/null
++++ b/backend/src/autobiz/customer_order_runtime.py
+@@ -0,0 +1,165 @@
++"""Durable customer order approval wiring; no provider calls or credentials."""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from typing import Any, Mapping
++from uuid import UUID
++
++from autobiz.automation_runtime import CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION, WorkerScope
++from autobiz.external_connector import ConnectorService, LocalCredentialResolver
++from autobiz.human_escalation import HumanEscalationService
++from autobiz.order_automation import (
++    OrderAutomationService,
++    OrderConversionService,
++    build_order_runtime,
++)
++from autobiz.policy_confirmation import ActionType, PendingActionStatus, PolicyConfirmationService
++from autobiz.surface_delivery import (
++    SurfaceAdapterRegistry,
++    SurfaceDeliveryPolicy,
++    SurfaceDeliveryService,
++)
++from autobiz.tenant import (
++    PostgresTenantAuthorization,
++    TenantContextError,
++    TenantContextResolver,
++    TenantGuard,
++    TenantIdentity,
++)
++
++
++def confirmation_expiry(payload: Mapping[str, Any], now: datetime) -> datetime:
++    value = payload.get("confirmation_expires_at")
++    if not isinstance(value, str):
++        raise ValueError("durable customer confirmation expiry is required")
++    expiry = datetime.fromisoformat(value)
++    if expiry.tzinfo is None or expiry <= now:
++        raise ValueError("customer confirmation expiry is stale")
++    return expiry.astimezone(UTC)
++
++
++def _resolver(connection: Any) -> TenantContextResolver:
++    return TenantContextResolver(TenantGuard(PostgresTenantAuthorization(connection)))
++
++
++def plan_waiting_order_attention(connection: Any, now: datetime) -> bool:
++    # Recovery also runs after a restart between WAITING and outbox planning.
++    with connection.transaction():
++        rows = connection.execute(
++            """
++            SELECT r.run_id, r.shop_id, r.initiating_actor_user_id,
++                   r.conversation_chat_id, r.correlation_id, e.event_id
++            FROM core_automation_runs r
++            JOIN core_automation_events e ON e.automation_run_id = r.run_id::text
++              AND e.shop_id = r.shop_id AND e.event_code = 'AUTOMATION_WAITING_CONFIRMATION'
++            JOIN core_automation_run_steps s ON s.run_id=r.run_id
++            JOIN core_pending_actions p ON p.pending_action_id=s.pending_action_id
++            WHERE r.automation_id = %s AND r.status = 'WAITING_CONFIRMATION'
++              AND p.status='PENDING' AND p.expires_at > %s
++              AND NOT EXISTS (
++                SELECT 1 FROM core_surface_deliveries d
++                JOIN core_human_escalations h ON h.escalation_id = d.escalation_id
++                WHERE h.shop_id = r.shop_id AND h.linked_run_id = r.run_id)
++            ORDER BY r.created_at, r.run_id LIMIT 20
++            FOR UPDATE OF r SKIP LOCKED
++            """,
++            (CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION.automation_id, now),
++        ).fetchall()
++        for run_id, shop, actor, conversation, correlation, event_id in rows:
++            try:
++                context = _resolver(connection).resolve(
++                    TenantIdentity(actor, conversation), str(shop), correlation
++                )
++            except TenantContextError:
++                continue
++            bindings = connection.execute(
++                "SELECT binding_id FROM core_surface_bindings WHERE shop_id=%s "
++                "AND actor_user_id=%s AND surface='telegram' AND status='ACTIVE' "
++                "AND conversation_type='PRIVATE' ORDER BY binding_id LIMIT 2",
++                (shop, actor),
++            ).fetchall()
++            # Ambiguous/missing destinations stay pending; never guess a shop or actor.
++            if len(bindings) != 1:
++                continue
++            escalations = HumanEscalationService(connection, clock=lambda: now)
++            case = escalations.materialize_event(context, event_id).case
++            if case is None:
++                continue
++            service = SurfaceDeliveryService(
++                connection,
++                escalations=escalations,
++                policy=SurfaceDeliveryPolicy(),
++                adapters=SurfaceAdapterRegistry(),
++                clock=lambda: now,
++            )
++            delivery = service.plan(context, case.escalation_id, binding_id=bindings[0][0])
++            if delivery is not None:
++                return True
++    return False
++
++
++def decide_order(
++    connection: Any, owner_context: Any, pending_id: UUID, *, approve: bool, now: datetime
++) -> str:
++    if owner_context.role != "owner":
++        raise ValueError("owner authority is required")
++    with connection.transaction():
++        row = connection.execute(
++            """
++            SELECT r.run_id, r.conversation_chat_id, r.correlation_id, r.status
++            FROM core_automation_runs r JOIN core_automation_run_steps s ON s.run_id=r.run_id
++            JOIN core_pending_actions p ON p.pending_action_id=s.pending_action_id
++            WHERE r.shop_id=%s AND p.shop_id=r.shop_id AND p.pending_action_id=%s
++              AND r.initiating_actor_user_id=%s AND p.requesting_actor_user_id=%s
++              AND r.automation_id=%s
++            FOR UPDATE OF r
++            """,
++            (
++                owner_context.shop_id,
++                pending_id,
++                owner_context.actor_user_id,
++                owner_context.actor_user_id,
++                CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION.automation_id,
++            ),
++        ).fetchone()
++        if row is None:
++            raise ValueError("customer order decision is not bound to this owner")
++        context = _resolver(connection).resolve(
++            TenantIdentity(owner_context.actor_user_id, row[1]), owner_context.shop_id, row[2]
++        )
++        confirmation = PolicyConfirmationService(connection, clock=lambda: now)
++        pending = confirmation.get_pending_action(context, pending_id, now=now)
++        if pending.action_type is not ActionType.ORDER_CONVERSION:
++            raise ValueError("customer order conversion is required")
++        if pending.status is PendingActionStatus.CANCELLED:
++            return "REJECTED"
++        if pending.status is PendingActionStatus.EXPIRED:
++            raise ValueError("customer order decision expired")
++        if row[3] == "COMPLETED":
++            return "COMPLETED"
++        conversion = OrderConversionService(
++            connection, confirmation=confirmation, clock=lambda: now
++        )
++        runtime = build_order_runtime(
++            connection, confirmation=confirmation, conversion=conversion, clock=lambda: now
++        )
++        if approve:
++            confirmation.confirm_pending_action(context, pending_id, now=now)
++            run = runtime.resume_confirmed(
++                context, WorkerScope("customer-owner-decision"), row[0], pending_id, now=now
++            )
++            return run.status.value
++        if pending.status is PendingActionStatus.CONFIRMED:
++            return "ALREADY_CONFIRMED"
++        resolver = _resolver(connection)
++        service = OrderAutomationService(
++            connection,
++            connectors=ConnectorService(
++                connection, credentials=LocalCredentialResolver({}), tenant_resolver=resolver
++            ),
++            runtime=runtime,
++            confirmation=confirmation,
++            clock=lambda: now,
++        )
++        return service.reject_pending_action(context, pending_id, now=now).status
+diff --git a/backend/src/autobiz/customer_result_delivery.py b/backend/src/autobiz/customer_result_delivery.py
+new file mode 100644
+--- /dev/null
++++ b/backend/src/autobiz/customer_result_delivery.py
+@@ -0,0 +1,120 @@
++"""Customer-result outbox -> authenticated n8n transport; no direct provider call."""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import json
++from datetime import UTC, datetime, timedelta
++from uuid import UUID
++
++from autobiz.audit_outbox import CUSTOMER_RESULT_MESSAGE_TYPE, DeliveryFailure
++from autobiz.external_connector import (
++    ConnectorInstallationRepository,
++    ConnectorType,
++    InstallationStatus,
++)
++from autobiz.integration_outbound import DispatchState
++from autobiz.integration_protocol import ActionIntent, ProtocolCapability
++from autobiz.tenant import (
++    PostgresTenantAuthorization,
++    TenantContextResolver,
++    TenantGuard,
++    TenantIdentity,
++)
++
++CONTRACT = "autobiz.customer-order-result.v1"
++
++
++def sign_customer_result(result, secret: bytes, created: int):
++    if not isinstance(secret, bytes) or len(secret) < 32:
++        raise ValueError("customer result credential is unavailable")
++    raw = json.dumps(
++        result, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False
++    ).encode()
++    material = CONTRACT.encode() + b"\n" + str(created).encode() + b"\n" + raw
++    return {
++        "result": result,
++        "customer_auth": {
++            "created": created,
++            "signature": hmac.new(secret, material, hashlib.sha256).hexdigest(),
++        },
++    }
++
++
++class CustomerResultHandler:
++    def __init__(self, connection, gateway, credentials, *, clock=None):
++        self.connection, self.gateway, self.credentials = connection, gateway, credentials
++        self.clock = clock or (lambda: datetime.now(UTC))
++
++    def deliver(self, message):
++        if message.message_type != CUSTOMER_RESULT_MESSAGE_TYPE:
++            raise DeliveryFailure("TERMINAL_INVALID_RESULT", "unsupported customer result message")
++        payload = message.payload
++        with self.connection.transaction():
++            row = self.connection.execute(
++                "SELECT d.source_installation_id,d.source_conversation_id,i.actor_user_id "
++                "FROM draft_orders d JOIN core_connector_installations i "
++                "ON i.installation_id=d.source_installation_id AND i.shop_id=d.shop_id "
++                "WHERE d.id=%s AND d.shop_id=%s",
++                (UUID(payload["draft_order_id"]), message.shop_id),
++            ).fetchone()
++            if row is None or row[1] != payload["customer_conversation_id"]:
++                raise DeliveryFailure(
++                    "TERMINAL_CUSTOMER_BINDING", "customer draft binding unavailable"
++                )
++            context = TenantContextResolver(
++                TenantGuard(PostgresTenantAuthorization(self.connection))
++            ).resolve(
++                TenantIdentity(row[2], f"customer-result:{row[1]}"),
++                message.shop_id,
++                message.correlation_id,
++            )
++            installation = ConnectorInstallationRepository(self.connection).get(context, row[0])
++            if (
++                installation is None
++                or installation.status is not InstallationStatus.ACTIVE
++                or installation.connector_type is not ConnectorType.CUSTOMER_BOT
++            ):
++                raise DeliveryFailure(
++                    "TERMINAL_CUSTOMER_INSTALLATION", "customer installation unavailable"
++                )
++            result = {
++                "contract": CONTRACT,
++                "external_account_reference": installation.external_account_reference,
++                "result_id": payload["result_id"],
++                "draft_order_id": payload["draft_order_id"],
++                "customer_conversation_id": row[1],
++                "result_kind": payload["result_kind"],
++                "order_id": payload["order_id"],
++            }
++            now = self.clock()
++            envelope = sign_customer_result(
++                result, self.credentials.resolve(installation), int(now.timestamp())
++            )
++        opaque = message.outbox_id.hex.translate(
++            str.maketrans("0123456789abcdef", "abcdefghijklmnop")
++        )
++        identity = f"customer-result:{opaque}"
++        intent = ActionIntent(
++            message_id=f"{identity}:{message.attempt_count}",
++            action_id=identity,
++            attempt_id=f"{identity}:{message.attempt_count}",
++            installation_id=str(installation.installation_id),
++            capability=ProtocolCapability.CUSTOMER_RESULT.value,
++            action_type="customer.result",
++            idempotency_key=identity,
++            correlation_id=message.correlation_id,
++            created_at=now,
++            expires_at=now + timedelta(minutes=5),
++            payload_schema="urn:autobiz:integration:customer-result:1",
++            payload=envelope,
++        )
++        acceptance = self.gateway.dispatch(context, intent, source_outbox_id=message.outbox_id)
++        if acceptance.state not in {
++            DispatchState.ACCEPTED_BY_FABRIC,
++            DispatchState.RESULT_EVIDENCE_PRESENT,
++        }:
++            raise DeliveryFailure(
++                "CUSTOMER_RESULT_TRANSPORT_UNCONFIRMED", "customer result dispatch not accepted"
++            )
+diff --git a/backend/src/autobiz/order_automation.py b/backend/src/autobiz/order_automation.py
+--- a/backend/src/autobiz/order_automation.py
++++ b/backend/src/autobiz/order_automation.py
+@@ -549,7 +549,7 @@
+         event_code: str,
+         metadata: dict[str, Any],
+     ) -> MutationResult:
+-        return self._recorder.record_result(
++        result = self._recorder.record_result(
+             context,
+             authorization,
+             action,
+@@ -562,6 +562,19 @@
+             EventSeverity.INFO if status is MutationStatus.APPLIED else EventSeverity.EXCEPTION,
+             metadata,
+         )
++        if status is MutationStatus.REVALIDATION_REQUIRED:
++            row = self._connection.execute(
++                "SELECT source_conversation_id FROM draft_orders WHERE shop_id=%s AND id=%s",
++                (context.shop_id, action.payload.draft_order_id),
++            ).fetchone()
++            if row is not None:
++                _enqueue_customer_result(
++                    self._connection, context, result,
++                    draft_order_id=action.payload.draft_order_id, order_id=None,
++                    customer_conversation_id=row[0],
++                    result_kind="OWNER_ORDER_REVALIDATION_REQUIRED", occurred_at=now,
++                )
++        return result
+ 
+ 
+ class OrderAutomationService:
+@@ -573,6 +586,7 @@
+         runtime: AutomationRuntimeService,
+         escalations: HumanEscalationService | None = None,
+         surface_delivery: SurfaceDeliveryService | None = None,
++        confirmation: PolicyConfirmationService | None = None,
+         events: AutomationEventLedger | None = None,
+         clock: Any | None = None,
+     ) -> None:
+@@ -583,7 +597,7 @@
+         self._surface_delivery = surface_delivery
+         self._events = events or AutomationEventLedger(connection)
+         self._clock = clock or (lambda: datetime.now(UTC))
+-        self._confirmation = getattr(surface_delivery, "_confirmation", None)
++        self._confirmation = confirmation or getattr(surface_delivery, "_confirmation", None)
+         self._rejection_recorder: TrustedMutationService | None = None
+         if surface_delivery is not None:
+             surface_delivery.set_rejection_handler(self.reject_pending_action)
+@@ -639,6 +653,7 @@
+                     "draft_order_id": str(draft.draft_order_id),
+                     "draft_payload_sha256": draft.conversion_payload_sha256,
+                     "external_order_reference": intent.external_order_reference,
++                    "confirmation_expires_at": expires.isoformat(),
+                 },
+                 now=current,
+             )
+@@ -966,4 +981,3 @@
+         mutations=mutations,
+         clock=clock,
+     )
+-
+diff --git a/backend/src/autobiz/automation_runtime.py b/backend/src/autobiz/automation_runtime.py
+--- a/backend/src/autobiz/automation_runtime.py
++++ b/backend/src/autobiz/automation_runtime.py
+@@ -1500,6 +1500,7 @@
+             "draft_order_id",
+             "draft_payload_sha256",
+             "external_order_reference",
++            "confirmation_expires_at",
+         },
+     }[action_type]
+     if set(payload) - allowed:
+@@ -1620,4 +1621,3 @@
+         ),
+     ),
+ )
+-
+diff --git a/backend/src/autobiz/worker.py b/backend/src/autobiz/worker.py
+--- a/backend/src/autobiz/worker.py
++++ b/backend/src/autobiz/worker.py
+@@ -14,6 +14,7 @@
+ 
+ from autobiz.audit_outbox import (
+     CONNECTOR_COMMAND_MESSAGE_TYPE,
++    CUSTOMER_RESULT_MESSAGE_TYPE,
+     FULFILLMENT_COMMAND_MESSAGE_TYPE,
+     SURFACE_DELIVERY_MESSAGE_TYPE,
+     OutboxHandler,
+@@ -21,6 +22,7 @@
+ )
+ from autobiz.automation_control_plane import AutomationEventLedger
+ from autobiz.automation_runtime import (
++    CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION,
+     INVENTORY_ADJUSTMENT_AUTOMATION,
+     PRICE_CHANGE_AUTOMATION,
+     AutomationDefinitionRegistry,
+@@ -41,6 +43,7 @@
+     StaticBridgeKeyResolver,
+ )
+ from autobiz.integration_outbound import HttpIntegrationFabricTransport, IntegrationOutboundGateway
++from autobiz.order_automation import OrderConversionService
+ from autobiz.policy_confirmation import PolicyConfirmationService
+ from autobiz.runtime_config import RuntimeConfig, RuntimeConfigurationError, RuntimeRole
+ from autobiz.surface_delivery import (
+@@ -66,6 +69,7 @@
+     "outbox-surface-delivery": SURFACE_DELIVERY_MESSAGE_TYPE,
+     "outbox-connector-command": CONNECTOR_COMMAND_MESSAGE_TYPE,
+     "outbox-fulfillment-command": FULFILLMENT_COMMAND_MESSAGE_TYPE,
++    "outbox-customer-result": CUSTOMER_RESULT_MESSAGE_TYPE,
+ }
+ OUTBOX_LANE_ORDER = tuple(OUTBOX_LANE_MESSAGE_TYPES)
+ OutboxHandlerFactory = Callable[[Any], OutboxHandler | None]
+@@ -184,7 +188,9 @@
+         runtime = self._runtime_factory(connection, self._lease)
+         claimed = runtime.claim_next(scope, now=now)
+         if claimed is None:
+-            return False
++            from autobiz.customer_order_runtime import plan_waiting_order_attention
++
++            return plan_waiting_order_attention(connection, now)
+         if claimed.initiating_actor_user_id is None:
+             runtime.block_unrecoverable_claim(
+                 scope,
+@@ -211,7 +217,25 @@
+                 error_summary="durable run could not recover verified tenant context",
+             )
+             return True
+-        runtime.execute_claim(context, scope, claimed.run_id, now=now)
++        expiry = None
++        if claimed.automation_id == CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION.automation_id:
++            from autobiz.customer_order_runtime import confirmation_expiry
++
++            try:
++                expiry = confirmation_expiry(claimed.trigger_payload, now)
++            except ValueError:
++                runtime.block_unrecoverable_claim(
++                    scope, claimed.run_id, now=now, error_code="CUSTOMER_CONFIRMATION_EXPIRED",
++                    error_summary="durable customer confirmation deadline is unavailable or expired",
++                )
++                return True
++        runtime.execute_claim(
++            context, scope, claimed.run_id, now=now, confirmation_expires_at=expiry
++        )
++        if claimed.automation_id == CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION.automation_id:
++            from autobiz.customer_order_runtime import plan_waiting_order_attention
++
++            plan_waiting_order_attention(connection, now)
+         return True
+ 
+ 
+@@ -330,11 +354,16 @@
+ 
+ def _runtime_factory(connection: Any, lease: timedelta) -> AutomationRuntimeService:
+     confirmation = PolicyConfirmationService(connection)
+-    mutations = TrustedMutationService(connection, confirmation_service=confirmation)
++    mutations = TrustedMutationService(
++        connection,
++        confirmation_service=confirmation,
++        order_conversion_service=OrderConversionService(connection, confirmation=confirmation),
++    )
+     return AutomationRuntimeService(
+         connection,
+         definitions=AutomationDefinitionRegistry(
+-            (PRICE_CHANGE_AUTOMATION, INVENTORY_ADJUSTMENT_AUTOMATION)
++            (PRICE_CHANGE_AUTOMATION, INVENTORY_ADJUSTMENT_AUTOMATION,
++             CUSTOMER_ORDER_DRAFT_APPROVAL_AUTOMATION)
+         ),
+         confirmation=confirmation,
+         mutations=mutations,
+@@ -403,8 +432,9 @@
+                 WHERE pending_action_id = %s
+                   AND shop_id = %s
+                   AND requesting_actor_user_id = %s
+-                  AND surface = %s
+-                  AND conversation_chat_id = %s
++                  AND ((surface = %s AND conversation_chat_id = %s)
++                       OR (action_type = 'ORDER_CONVERSION' AND surface = 'automation_runtime'
++                           AND request_origin = 'automation_runtime'))
+                 """,
+                 (
+                     pending_action_id,
+@@ -477,6 +507,25 @@
+     )
+ 
+ 
++def _customer_result_handler_factory(connection: Any) -> OutboxHandler:
++    from autobiz.api import database_connection_factory
++    from autobiz.customer_result_delivery import CustomerResultHandler
++
++    config = RuntimeConfig.from_environment(RuntimeRole.WORKER, os.environ)
++    key = BridgeKey(
++        key_id=_required_worker_env("AUTOBIZ_INTEGRATION_CORE_TO_N8N_KEY_ID"),
++        principal=_required_worker_env("AUTOBIZ_INTEGRATION_CORE_TO_N8N_PRINCIPAL"),
++        direction=BridgeDirection.CORE_TO_N8N, state=BridgeKeyState.ACTIVE,
++        secret=_required_worker_env("AUTOBIZ_INTEGRATION_CORE_TO_N8N_SECRET").encode(),
++    )
++    gateway = IntegrationOutboundGateway(
++        database_connection_factory(config),
++        HttpIntegrationFabricTransport(_required_worker_env("AUTOBIZ_CUSTOMER_RESULT_FABRIC_BASE_URL")),
++        StaticBridgeKeyResolver({key.key_id: key}), key_id=key.key_id,
++    )
++    return CustomerResultHandler(connection, gateway, DopplerCredentialResolver.from_environment(connection))
++
++
+ def _fulfillment_handler_factory(connection: Any) -> OutboxHandler:
+     return FulfillmentService(
+         connection,
+@@ -490,6 +539,7 @@
+     "outbox-surface-delivery": _surface_handler_factory,
+     "outbox-connector-command": _connector_handler_factory,
+     "outbox-fulfillment-command": _fulfillment_handler_factory,
++    "outbox-customer-result": _customer_result_handler_factory,
+ }
+ 
+ 
+@@ -542,4 +592,3 @@
+ 
+ if __name__ == "__main__":
+     main()
+-
+diff --git a/backend/src/autobiz/runtime_config.py b/backend/src/autobiz/runtime_config.py
+--- a/backend/src/autobiz/runtime_config.py
++++ b/backend/src/autobiz/runtime_config.py
+@@ -25,6 +25,7 @@
+         "outbox-surface-delivery",
+         "outbox-connector-command",
+         "outbox-fulfillment-command",
++        "outbox-customer-result",
+     }
+ )
+ _RELEASE_PATTERN = re.compile(r"^(?:[0-9a-f]{7,64}|local-[A-Za-z0-9][A-Za-z0-9.-]{0,63})$")
+@@ -335,4 +336,3 @@
+                 else 15.0
+             ),
+         )
+-
+diff --git a/backend/src/autobiz/owner_surface_confirmation.py b/backend/src/autobiz/owner_surface_confirmation.py
+--- a/backend/src/autobiz/owner_surface_confirmation.py
++++ b/backend/src/autobiz/owner_surface_confirmation.py
+@@ -151,6 +151,28 @@
+         correlation_id: str,
+     ) -> AssistantResponse | None:
+         normalized = _normalize(text)
++        order_decision = re.fullmatch(r"/(approve|reject) ([0-9a-f-]{36})", normalized)
++        if order_decision is not None:
++            from autobiz.customer_order_runtime import decide_order
++
++            connection = self._connections()
++            try:
++                outcome = decide_order(
++                    connection, context, UUID(order_decision.group(2)),
++                    approve=order_decision.group(1) == "approve", now=self._now(),
++                )
++                message = {
++                    "COMPLETED": "Đơn hàng đã được xác nhận.",
++                    "REJECTED": "Đơn hàng đã bị từ chối.",
++                    "ALREADY_CONFIRMED": "Đơn hàng đã được xác nhận trước đó.",
++                }.get(outcome, "Đơn hàng chưa thể chuyển đổi; vui lòng kiểm tra trạng thái.")
++                return AssistantResponse(
++                    kind=AssistantResponseKind.ANSWER, text=message, correlation_id=correlation_id
++                )
++            except (ValueError, PolicyConfirmationError):
++                return _failure(correlation_id, "Không thể xác nhận đơn này; kiểm tra quyền và thời hạn.")
++            finally:
++                connection.close()
+         request = _parse_request(normalized)
+         is_control = normalized in _CONFIRM_PHRASES or normalized in _CANCEL_PHRASES
+         if request is None and not is_control:
+@@ -925,4 +947,3 @@
+     "ConfirmingAssistantEngineOwnerSurfaceHandler",
+     "OwnerSurfaceActionCoordinator",
+ ]
+-
+diff --git a/backend/src/autobiz/surface_delivery.py b/backend/src/autobiz/surface_delivery.py
+--- a/backend/src/autobiz/surface_delivery.py
++++ b/backend/src/autobiz/surface_delivery.py
+@@ -1349,6 +1349,17 @@
+                     SurfaceAction("REJECT_PENDING_ACTION", str(case.linked_pending_action_id)),
+                 ]
+             )
++        body = self._escalations.render_case(context, case)
++        if case.linked_pending_action_id is not None:
++            pending_order = self._connection.execute(
++                "SELECT 1 FROM core_pending_actions WHERE shop_id=%s "
++                "AND pending_action_id=%s AND action_type='ORDER_CONVERSION'",
++                (context.shop_id, case.linked_pending_action_id),
++            ).fetchone()
++            if pending_order is not None:
++                reference = str(case.linked_pending_action_id)
++                suffix = f"\n/approve {reference}\n/reject {reference}"
++                body = body[:MAX_BODY - len(suffix)] + suffix
+         return DeliveryEnvelope(
+             delivery_key=_delivery_key(
+                 context.shop_id, case.escalation_id, case.version, binding.binding_id, message_kind
+@@ -1360,7 +1371,7 @@
+             surface=binding.surface,
+             binding_id=binding.binding_id,
+             message_kind=message_kind,
+-            rendered_body=self._escalations.render_case(context, case),
++            rendered_body=body,
+             actions=tuple(actions[:4]),
+             correlation_id=case.correlation_id,
+         )
+@@ -1506,4 +1517,3 @@
+         (outbox_id,),
+     ).fetchone()
+     return None if row is None else SurfaceDeliveryRepository._delivery(row)
+-
+diff --git a/backend/src/autobiz/integration_outbound.py b/backend/src/autobiz/integration_outbound.py
+--- a/backend/src/autobiz/integration_outbound.py
++++ b/backend/src/autobiz/integration_outbound.py
+@@ -17,6 +17,7 @@
+ 
+ from autobiz.external_connector import (
+     ConnectorInstallationRepository,
++    ConnectorType,
+     InstallationStatus,
+ )
+ from autobiz.integration_bridge_security import (
+@@ -26,7 +27,12 @@
+     BridgeSecurityError,
+     sign_request,
+ )
+-from autobiz.integration_protocol import ActionIntent, DeliveryIntent, MessageFamily
++from autobiz.integration_protocol import (
++    ActionIntent,
++    DeliveryIntent,
++    MessageFamily,
++    ProtocolCapability,
++)
+ from autobiz.tenant import VerifiedTenantContext
+ 
+ ConnectionFactory = Callable[[], psycopg.Connection[Any]]
+@@ -410,6 +416,12 @@
+         intent: OutboundIntent,
+         authority_id: UUID,
+     ) -> None:
++        customer_result = (
++            isinstance(intent, ActionIntent)
++            and intent.capability == ProtocolCapability.CUSTOMER_RESULT.value
++            and intent.action_type == "customer.result"
++            and intent.payload_schema == "urn:autobiz:integration:customer-result:1"
++        )
+         if isinstance(intent, ActionIntent):
+             installation = ConnectorInstallationRepository(connection).internal(authority_id)
+             if (
+@@ -418,6 +430,14 @@
+                 or installation.shop_id != context.shop_id
+             ):
+                 raise OutboundGatewayError("outbound installation is not authorized")
++            if customer_result and (
++                installation.connector_type is not ConnectorType.CUSTOMER_BOT
++                or installation.actor_user_id != context.actor_user_id
++                or installation.external_account_reference != intent.payload.get("result", {}).get(
++                    "external_account_reference"
++                )
++            ):
++                raise OutboundGatewayError("customer result installation is not authorized")
+             return
+ 
+         binding = connection.execute(
+@@ -490,4 +510,3 @@
+     "TransportStatus",
+     "serialize_intent",
+ ]
+-
+diff --git a/backend/src/autobiz/api.py b/backend/src/autobiz/api.py
+--- a/backend/src/autobiz/api.py
++++ b/backend/src/autobiz/api.py
+@@ -15,6 +15,7 @@
+     AdminSessionResolver,
+     register_admin_control_plane,
+ )
++from autobiz.customer_order_ingress import CUSTOMER_ORDER_PATH, CustomerOrderIngress
+ from autobiz.erp_history_projection import (
+     LICH_SU_KHO_PROJECTION_PATH,
+     InventoryHistoryProjectionIngress,
+@@ -158,6 +159,7 @@
+     readiness_probe: ReadinessProbe | None = None,
+     monitoring_authenticator: InternalMonitoringAuthenticator | None = None,
+     integration_ingress: IntegrationIngress | None = None,
++    customer_order_ingress: CustomerOrderIngress | None = None,
+     integration_result_ingress: IntegrationResultIngress | None = None,
+     erp_projection_ingress: ERPProjectionIngress | None = None,
+     erp_history_projection_ingress: InventoryHistoryProjectionIngress | None = None,
+@@ -830,6 +832,37 @@
+                         media_type="application/problem+json",
+                     )
+ 
++    if customer_order_ingress is not None:
++
++        @app.post(CUSTOMER_ORDER_PATH)
++        async def customer_order_intents(request: Request) -> JSONResponse:
++            try:
++                accepted = customer_order_ingress.accept_raw_request(
++                    body=await _read_bounded_body(request),
++                    method=request.method,
++                    path=request.url.path,
++                    headers=request.headers,
++                )
++                return JSONResponse(status_code=202, content=accepted)
++            except IntegrationIngressError as error:
++                return JSONResponse(
++                    status_code=error.status,
++                    content=error.problem(),
++                    media_type="application/problem+json",
++                )
++            except Exception:  # noqa: BLE001 - bounded HTTP boundary
++                error = IntegrationIngressError(
++                    503,
++                    "INTEGRATION_INTERNAL_ERROR",
++                    "customer ingress unavailable",
++                    retryable=True,
++                )
++                return JSONResponse(
++                    status_code=error.status,
++                    content=error.problem(),
++                    media_type="application/problem+json",
++                )
++
+     return app
+ 
+ 
+@@ -857,6 +890,7 @@
+             ),
+             monitoring_authenticator=monitoring_authenticator,
+             integration_ingress=runtime.integration_ingress if runtime else None,
++            customer_order_ingress=runtime.customer_order_ingress if runtime else None,
+             integration_result_ingress=runtime.integration_result_ingress if runtime else None,
+             erp_projection_ingress=runtime.erp_projection_ingress if runtime else None,
+             erp_history_projection_ingress=erp_history_projection_ingress,
+@@ -883,4 +917,3 @@
+ 
+ if __name__ == "__main__":
+     main()
+-
+diff --git a/backend/src/autobiz/customer_surface.py b/backend/src/autobiz/customer_surface.py
+--- a/backend/src/autobiz/customer_surface.py
++++ b/backend/src/autobiz/customer_surface.py
+@@ -219,6 +219,34 @@
+             now=now,
+         )
+ 
++    def start_verified_order(
++        self,
++        request: CustomerSurfaceRequest,
++        event: ExternalEvent,
++        *,
++        confirmation_expires_at: datetime,
++        now: datetime | None = None,
++    ) -> OrderAutomationStart:
++        """Only accepts a persisted bridge-verified event, never a raw webhook."""
++        installation = self._connectors.installations.internal(event.installation_id)
++        if (
++            installation is None
++            or installation.shop_id != event.shop_id
++            or installation.connector_type != request.connector_type
++            or installation.external_account_reference != request.external_account_reference
++            or event.external_object_id != request.external_order_reference
++            or event.provider_event_id != request.provider_event_id
++            or event.payload != request.payload
++        ):
++            raise WebhookRejected("customer event does not match its trusted installation")
++        context = self._trusted_context(event, request)
++        return self._orders.start(
++            context,
++            event,
++            confirmation_expires_at=confirmation_expires_at,
++            now=now,
++        )
++
+     def clarification_turn(
+         self, request: CustomerSurfaceRequest, turn_text: str
+     ) -> ClarificationResult:
+@@ -265,4 +293,3 @@
+             installation.shop_id,
+             f"customer:{request.surface}:{request.customer_conversation_id}",
+         )
+-
+diff --git a/backend/src/autobiz/external_connector.py b/backend/src/autobiz/external_connector.py
+--- a/backend/src/autobiz/external_connector.py
++++ b/backend/src/autobiz/external_connector.py
+@@ -37,6 +37,7 @@
+ 
+ 
+ class ConnectorType(str, Enum):
++    CUSTOMER_BOT = "customer_bot"
+     LOCAL_FIXTURE = "local_fixture"
+     SECOND_FIXTURE = "second_fixture"
+     GOOGLE_SHEETS = "google_sheets"
+@@ -801,6 +802,15 @@
+             True,
+             True,
+             True,
++        ),
++        ConnectorType.CUSTOMER_BOT: ConnectorDefinition(
++            ConnectorType.CUSTOMER_BOT,
++            1,
++            frozenset({ConnectorCapability.WEBHOOK}),
++            frozenset(),
++            True,
++            False,
++            False,
+         ),
+         ConnectorType.GOOGLE_SHEETS: ConnectorDefinition(
+             ConnectorType.GOOGLE_SHEETS,
+@@ -851,7 +861,9 @@
+         self._adapters = {
+             connector_type: supplied.get(connector_type)
+             or (
+-                ShopeeProviderAdapter()
++                BridgeOnlyCustomerConnector()
++                if connector_type is ConnectorType.CUSTOMER_BOT
++                else ShopeeProviderAdapter()
+                 if connector_type is ConnectorType.SHOPEE
+                 else LocalDeterministicConnector(connector_type)
+             )
+@@ -1185,6 +1197,26 @@
+         "payload": webhook.payload,
+     }
+     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
++
++
++@dataclass
++class BridgeOnlyCustomerConnector:
++    """Customer Bot never authenticates using the local fixture adapter."""
++
++    connector_type = ConnectorType.CUSTOMER_BOT
++
++    def authenticate_webhook(self, *_: Any, **__: Any) -> None:
++        raise WebhookRejected("customer requests require the signed customer ingress")
++
++    def normalize_webhook(self, *_: Any, **__: Any) -> None:
++        raise WebhookRejected("customer requests require the signed customer ingress")
++
++    def read(self, *_: Any, **__: Any) -> None:
++        raise ConnectorCapabilityError("customer connector is ingress only")
++
++    pull = read
++    send = read
++    health_check = read
+ 
+ 
+ @dataclass
+@@ -2365,4 +2397,3 @@
+     if not isinstance(result, ProviderResult):
+         raise TypeError("provider result must be typed")
+     return result
+-
+diff --git a/backend/src/autobiz/integration_runtime.py b/backend/src/autobiz/integration_runtime.py
+--- a/backend/src/autobiz/integration_runtime.py
++++ b/backend/src/autobiz/integration_runtime.py
+@@ -10,6 +10,7 @@
+ 
+ from autobiz.assistant_experience import AssistantEngine
+ from autobiz.clarification import ClarificationEngine
++from autobiz.customer_order_ingress import CustomerOrderIngress
+ from autobiz.erp_projection import (
+     ERPProjectionError,
+     resolve_bao_cao_projection_installation,
+@@ -83,6 +84,7 @@
+     sheet_mapping_ingress: SheetMappingIngress
+     sheet_erp_ingress: SheetERPIngress
+     sheet_inventory_scan_ingress: InventorySheetScanIngress
++    customer_order_ingress: CustomerOrderIngress | None = None
+     shop_onboarding_ingress: ShopOnboardingIngress | None = None
+     shop_onboarding_provisioner: SheetProvisioner | None = None
+ 
+@@ -308,6 +310,15 @@
+     return IntegrationRuntime(
+         connection_factory=connections,
+         integration_ingress=IntegrationIngress(connections, resolver),
++        customer_order_ingress=CustomerOrderIngress(
++            connections,
++            resolver,
++            confirmation_ttl_seconds=int(
++                _required(environ, "AUTOBIZ_CUSTOMER_CONFIRMATION_TTL_SECONDS")
++            ),
++        )
++        if _enabled(environ, "AUTOBIZ_CUSTOMER_ORDER_INGRESS_ENABLED")
++        else None,
+         integration_result_ingress=IntegrationResultIngress(
+             connections,
+             resolver,
+@@ -400,4 +411,3 @@
+         erp_order_edit_ingress=erp_order_edit_ingress,
+         ai_runtime=ai_runtime,
+     )
+-

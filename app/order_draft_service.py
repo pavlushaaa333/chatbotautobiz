@@ -3,13 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping, MutableMapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from collections.abc import Mapping, MutableMapping
 from typing import Any
 from uuid import uuid4
-
 
 import requests
 
@@ -17,8 +16,10 @@ from app.config import active_shop_id
 from app.customer_intent import (
     build_customer_intent,
     customer_envelope,
-    enabled as customer_ingress_enabled,
     validate_receipt,
+)
+from app.customer_intent import (
+    enabled as customer_ingress_enabled,
 )
 from app.normalizer import extract_color, extract_size, normalize_text, strip_accents
 
@@ -788,6 +789,9 @@ def submit_draft_order_to_n8n(draft_order: Mapping[str, Any]) -> SubmissionResul
         if customer_ingress_enabled():
             try:
                 validate_receipt(response.json(), payload)
+                from app.customer_result import remember_receipt
+
+                remember_receipt(response.json(), payload)
             except (ValueError, TypeError, KeyError):
                 return SubmissionResult(
                     ok=False, status_code=status_code, error_type="invalid_core_receipt",

@@ -1,0 +1,202 @@
+{
+  "name": "AUTOBIZ_ADAPTER_Telegram_Customer_Order_Intent",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "v1/customer/order-intents",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "customer-webhook",
+      "name": "Receive signed Customer Bot request"
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $json.body;\nif (!envelope || Array.isArray(envelope) || typeof envelope !== 'object') throw new Error('customer envelope required');\nif (Object.keys(envelope).sort().join(',') !== 'customer_auth,intent') throw new Error('bounded envelope required');\nconst input = envelope.intent;\nconst proof = envelope.customer_auth;\nconst allowed = new Set(['contract','surface','external_account_reference','provider_event_id','external_order_reference','customer_conversation_id','items','customer','note']);\nif (!input || Object.keys(input).some(k => !allowed.has(k))) throw new Error('unsupported intent fields');\nif (input.contract !== 'autobiz.customer-order-intent.v1' || input.surface !== 'telegram') throw new Error('unsupported customer contract');\nfunction text(value, max) {\n  if (typeof value !== 'string' || !value.trim() || value.length > max || /[\\u0000-\\u001f\\u007f]/.test(value)) throw new Error('invalid bounded customer field');\n}\nfor (const key of ['external_account_reference','provider_event_id','external_order_reference','customer_conversation_id']) text(input[key],255);\nif (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 20) throw new Error('invalid bounded items');\nfor (const item of input.items) {\n  if (!item || Object.keys(item).some(k => !['sku','variant','quantity'].includes(k))) throw new Error('unsupported item fields');\n  text(item.sku,50); text(item.variant,100);\n  if (!Number.isInteger(item.quantity) || item.quantity < 1 || item.quantity > 1000) throw new Error('invalid quantity');\n}\nif (!input.customer || Object.keys(input.customer).some(k => !['name','phone','address','reference'].includes(k))) throw new Error('invalid customer fields');\nfor (const [key,max] of [['name',255],['phone',50],['address',1000]]) text(input.customer[key],max);\nif (input.customer.reference !== undefined) text(input.customer.reference,255);\nif (input.note !== undefined) text(input.note,1000);\nif (!proof || Object.keys(proof).sort().join(',') !== 'created,signature' || !Number.isSafeInteger(proof.created) || !/^[0-9a-f]{64}$/.test(proof.signature)) throw new Error('invalid customer proof');\nfunction stable(v) {\n  if (Array.isArray(v)) return '[' + v.map(stable).join(',') + ']';\n  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stable(v[k])).join(',') + '}';\n  return JSON.stringify(v);\n}\nconst body = stable(envelope);\nif (Buffer.byteLength(body,'utf8') > 8192) throw new Error('customer envelope too large');\nreturn [{json:{method:'POST',path:'/v1/integration/customer-order-intents',content_type:'application/json',body,security_profile:'RFC9421_HMAC_SHA256_V1',direction:'N8N_TO_CORE'}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "id": "customer-normalize",
+      "name": "Normalize bounded customer intent"
+    },
+    {
+      "parameters": {
+        "mode": "each",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "AUTOBIZ_BRIDGE_SIGN_N8N_TO_CORE_V1"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "method": "={{$json.method}}",
+            "path": "={{$json.path}}",
+            "content_type": "={{$json.content_type}}",
+            "body": "={{$json.body}}",
+            "security_profile": "={{$json.security_profile}}",
+            "direction": "={{$json.direction}}"
+          }
+        }
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        480,
+        0
+      ],
+      "id": "customer-sign",
+      "name": "Sign customer intent with existing bridge"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{'http://autobiz-api.railway.internal:8080/v1/integration/customer-order-intents'}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "={{$json.headers['content-type']}}"
+            },
+            {
+              "name": "Content-Digest",
+              "value": "={{$json.headers['content-digest']}}"
+            },
+            {
+              "name": "Signature-Input",
+              "value": "={{$json.headers['signature-input']}}"
+            },
+            {
+              "name": "Signature",
+              "value": "={{$json.headers.signature}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{$json.body}}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        0
+      ],
+      "id": "customer-core",
+      "name": "Send signed customer intent to Core"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json;\nconst input = JSON.parse($('Normalize bounded customer intent').item.json.body).intent;\nif (!result || result.status !== 'DRAFT_CREATED' || result.draft_status !== 'draft' || result.external_order_reference !== input.external_order_reference) throw new Error('Core did not confirm this draft');\nconst uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nfor (const key of ['draft_order_id','run_id','event_id']) if (!uuid.test(result[key])) throw new Error('invalid bounded Core receipt');\nreturn [{json:{status:result.status,draft_status:result.draft_status,external_order_reference:result.external_order_reference,draft_order_id:result.draft_order_id,run_id:result.run_id,event_id:result.event_id}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ],
+      "id": "customer-result",
+      "name": "Validate Core draft receipt"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1200,
+        0
+      ],
+      "id": "customer-response",
+      "name": "Return confirmed draft receipt"
+    }
+  ],
+  "connections": {
+    "Receive signed Customer Bot request": {
+      "main": [
+        [
+          {
+            "node": "Normalize bounded customer intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize bounded customer intent": {
+      "main": [
+        [
+          {
+            "node": "Sign customer intent with existing bridge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign customer intent with existing bridge": {
+      "main": [
+        [
+          {
+            "node": "Send signed customer intent to Core",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send signed customer intent to Core": {
+      "main": [
+        [
+          {
+            "node": "Validate Core draft receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Core draft receipt": {
+      "main": [
+        [
+          {
+            "node": "Return confirmed draft receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  },
+  "staticData": {},
+  "tags": []
+}

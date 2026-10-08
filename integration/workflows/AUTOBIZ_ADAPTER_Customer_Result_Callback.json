@@ -1,0 +1,265 @@
+{
+  "name": "AUTOBIZ_ADAPTER_Customer_Result_Callback",
+  "active": false,
+  "nodes": [
+    {
+      "name": "Receive signed customer result",
+      "id": "receive-signed-customer-result",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "customer-results/v1/fabric/actions",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Map exact result bytes",
+      "id": "map-exact-result-bytes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const raw = await this.helpers.getBinaryDataBuffer(0, 'data');\nif (!raw || raw.length > 65536) throw new Error('bounded raw Core body required');\nconst headers = Object.fromEntries(Object.entries($json.headers ?? {}).map(([k,v]) => [k.toLowerCase(),String(v)]));\nreturn [{json:{raw_body:raw.toString('utf8'),method:'POST',path:'/v1/fabric/actions',content_type:'application/json',headers}}];"
+      },
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Verify Core result bridge",
+      "id": "verify-core-result-bridge",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "parameters": {
+        "mode": "each",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "AUTOBIZ_BRIDGE_VERIFY_CORE_TO_N8N_V1"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "raw_body": "={{$json.raw_body}}",
+            "method": "={{$json.method}}",
+            "path": "={{$json.path}}",
+            "content_type": "={{$json.content_type}}",
+            "headers": "={{$json.headers}}"
+          },
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Parse verified customer result",
+      "id": "parse-verified-customer-result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "if ($json.verified !== true || typeof $json.raw_body !== 'string') throw new Error('verified Core request required');\nconst intent = JSON.parse($json.raw_body);\nif (intent.family !== 'ACTION_INTENT' || intent.action_type !== 'customer.result' || intent.capability !== 'customer.result' || intent.payload_schema !== 'urn:autobiz:integration:customer-result:1') throw new Error('customer result contract required');\nif (!Number.isFinite(Date.parse(intent.expires_at)) || Date.parse(intent.expires_at) <= Date.now()) throw new Error('expired result transport');\nconst envelope = intent.payload;\nif (envelope.result.contract !== 'autobiz.customer-order-result.v1' || typeof envelope.result.external_account_reference !== 'string') throw new Error('account binding mismatch');\nreturn [{json:{intent,envelope}}];"
+      },
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Forward to Customer Bot callback",
+      "id": "forward-to-customer-bot-callback",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.AUTOBIZ_CUSTOMER_BOT_CALLBACK_URL}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.envelope}}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Validate Bot delivery receipt",
+      "id": "validate-bot-delivery-receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const source = $('Parse verified customer result').item.json;\nconst receipt = $json;\nif (receipt.status !== 'DELIVERED' || receipt.result_id !== source.envelope.result.result_id) throw new Error('Customer Bot has not confirmed delivery');\nconst intent=source.intent;\nreturn [{json:{protocol_version:'1.0',message_id:`customer-result-receipt:${intent.message_id}`,family:'ACTION_RESULT',action_id:intent.action_id,attempt_id:intent.attempt_id,installation_id:intent.installation_id,status:'SUCCEEDED',provider_reference:receipt.result_id,error:null,retry_after_seconds:null,correlation_id:intent.correlation_id,idempotency_key:intent.idempotency_key,observed_at:new Date().toISOString(),metadata:{duplicate:receipt.duplicate===true}}}];"
+      },
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "Record result in Core",
+      "id": "record-result-in-core",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "parameters": {
+        "mode": "each",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "AUTOBIZ_BRIDGE_ACTION_RESULT_V1"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "protocol_version": "={{$json.protocol_version}}",
+            "message_id": "={{$json.message_id}}",
+            "family": "={{$json.family}}",
+            "action_id": "={{$json.action_id}}",
+            "attempt_id": "={{$json.attempt_id}}",
+            "installation_id": "={{$json.installation_id}}",
+            "status": "={{$json.status}}",
+            "provider_reference": "={{$json.provider_reference}}",
+            "error": "={{$json.error}}",
+            "retry_after_seconds": "={{$json.retry_after_seconds}}",
+            "correlation_id": "={{$json.correlation_id}}",
+            "idempotency_key": "={{$json.idempotency_key}}",
+            "observed_at": "={{$json.observed_at}}",
+            "metadata": "={{$json.metadata}}"
+          },
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "position": [
+        1440,
+        0
+      ]
+    },
+    {
+      "name": "Acknowledge result transport",
+      "id": "acknowledge-result-transport",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {status:'ACCEPTED'} }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "position": [
+        1680,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Receive signed customer result": {
+      "main": [
+        [
+          {
+            "node": "Map exact result bytes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map exact result bytes": {
+      "main": [
+        [
+          {
+            "node": "Verify Core result bridge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Core result bridge": {
+      "main": [
+        [
+          {
+            "node": "Parse verified customer result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse verified customer result": {
+      "main": [
+        [
+          {
+            "node": "Forward to Customer Bot callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forward to Customer Bot callback": {
+      "main": [
+        [
+          {
+            "node": "Validate Bot delivery receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Bot delivery receipt": {
+      "main": [
+        [
+          {
+            "node": "Record result in Core",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record result in Core": {
+      "main": [
+        [
+          {
+            "node": "Acknowledge result transport",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false
+  }
+}

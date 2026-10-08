@@ -27,3 +27,12 @@ vectorstore/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local integration checks, handoff archives and receipt ledgers
+work/
+outputs/
+.test-data/
+.ruff_cache/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
