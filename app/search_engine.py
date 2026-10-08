@@ -594,6 +594,7 @@ class ProductSearchEngine:
         return {
             "variant_id": str(variant.get("variant_id") or ""),
             "sku": str(variant.get("sku") or ""),
+            "variant": variant.get("variant"),
             "size": str(variant.get("size") or ""),
             "color": str(variant.get("color") or ""),
             "stock": stock,
@@ -1250,6 +1251,7 @@ class PostgresProductSearchEngine:
         return {
             "variant_id": str(variant.get("variant_id") or variant.get("sku") or ""),
             "sku": str(variant.get("sku") or ""),
+            "variant": variant.get("variant"),
             "size": variant.get("size"),
             "color": variant.get("color"),
             "stock": stock,

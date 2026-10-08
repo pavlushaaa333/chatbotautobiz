@@ -11,7 +11,6 @@ import app.service as service_module
 from app.order_draft_service import (
     ORDER_STATE_AWAITING_CONFIRMATION,
     ORDER_STATE_PENDING_SHOP_APPROVAL,
-    ORDER_STATE_SUBMISSION_FAILED,
     SubmissionResult,
     blank_order_draft,
     build_n8n_payload,
@@ -99,6 +98,7 @@ def valid_draft(draft_id: str = "DRAFT-TEST-0001") -> dict:
 def fake_service() -> ChatbotService:
     service = ChatbotService.__new__(ChatbotService)
     service.product_data_source = "csv"
+    service.active_shop_id = "shop-1"
     service.search_engine = FakeSearchEngine()
     service.rag_service = FakeRagService()
     return service

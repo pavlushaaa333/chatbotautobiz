@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Any
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.config import DATA_DIR
+load_dotenv()
 from app.schemas import (
     ChatRequest,
     ChatResponse,
@@ -16,12 +18,12 @@ from app.schemas import (
     RAGSearchRequest,
     SearchRequest,
 )
-from app.service import get_service
 
 app = FastAPI(title="AutoBiz MVP Source Open", version="0.1.0")
 
 
 def _service():
+    from app.service import get_service
     try:
         return get_service()
     except Exception as exc:
@@ -120,29 +122,28 @@ def _send_telegram_message(chat_id: str, text: str) -> dict[str, Any]:
     if not token:
         raise HTTPException(status_code=500, detail="Missing TELEGRAM_BOT_TOKEN")
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-        },
-        timeout=10,
-    )
-
     try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
         response.raise_for_status()
-    except requests.HTTPError as exc:
+        result = response.json()
+    except (requests.RequestException, ValueError):
         raise HTTPException(
             status_code=502,
-            detail=f"Telegram sendMessage failed: {response.text}",
-        ) from exc
+            detail="Telegram sendMessage failed",
+        ) from None
 
-    return response.json()
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise HTTPException(status_code=502, detail="Telegram delivery was not confirmed")
+    return result
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "data_dir": str(DATA_DIR)}
+    return {"status": "ok"}
 
 
 @app.post("/parse")
@@ -188,9 +189,13 @@ def order_status_webhook(
     payload: OrderStatusPayload,
     x_autobiz_secret: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    if os.getenv("AUTOBIZ_LEGACY_ORDER_STATUS_ENABLED", "").lower() != "true":
+        raise HTTPException(status_code=410, detail="Use authenticated customer-order-results")
     expected_secret = _webhook_secret()
 
-    if expected_secret and x_autobiz_secret != expected_secret:
+    if not expected_secret:
+        raise HTTPException(status_code=503, detail="Webhook authentication is unavailable")
+    if not hmac.compare_digest(x_autobiz_secret or "", expected_secret):
         raise HTTPException(status_code=401, detail="Invalid x-autobiz-secret")
 
     chat_id = _normalize_telegram_chat_id(payload.customer_chat_id)
@@ -217,3 +222,19 @@ def order_status_webhook(
         "telegram_chat_id": chat_id,
         "telegram_result": telegram_result,
     }
+
+
+@app.post("/webhooks/customer-order-results")
+async def customer_order_result(request: Request):
+    from app.customer_result import AuthenticationUnavailable, deliver_result
+    raw = await request.body()
+    if len(raw) > 8192:
+        raise HTTPException(status_code=413, detail="Customer result too large")
+    try:
+        return deliver_result(await request.json(), _send_telegram_message)
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=401, detail="Customer result rejected") from None
+    except AuthenticationUnavailable:
+        raise HTTPException(status_code=503, detail="Customer result authentication unavailable") from None
+    except RuntimeError:
+        raise HTTPException(status_code=409, detail="Customer result requires reconciliation") from None
